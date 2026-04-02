@@ -8,6 +8,7 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/usb/usb_device.h>
+#include <string.h>
 
 BUILD_ASSERT(DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_console), zephyr_cdc_acm_uart),
 	     "Console device is not ACM CDC UART device");
@@ -28,6 +29,44 @@ double battery_max_temp;
 bool session_error = false;
 
 const struct device *can_dev;
+const struct device *usb_uart_dev = NULL;
+
+static bool is_heating_enabled = false;
+
+static void process_char(char c) {
+    static char buf[64];
+    static int pos = 0;
+
+    if (c == '\n' || c == '\r') {
+        buf[pos] = '\0';
+        if (pos > 0) {
+            if (strcmp(buf, "HEAT_ENABLE") == 0) {
+                is_heating_enabled = true;
+                printk("Heating enabled via USB\n");
+            } else if (strcmp(buf, "HEAT_DISABLE") == 0) {
+                is_heating_enabled = false;
+                printk("Heating disabled via USB\n");
+            }
+            pos = 0;
+        }
+    } else if (pos < sizeof(buf) - 1) {
+        buf[pos++] = c;
+    }
+}
+
+static void uart_isr(const struct device *dev, void *user_data)
+{
+    uint8_t c;
+    if (!uart_irq_update(dev)) {
+        return;
+    }
+
+    if (uart_irq_rx_ready(dev)) {
+        while (uart_fifo_read(dev, &c, 1) == 1) {
+            process_char((char)c);
+        }
+    }
+}
 
 static struct gpio_dt_spec led = GPIO_DT_SPEC_GET_OR(DT_ALIAS(led0), gpios,
                                                      {0});
@@ -131,7 +170,7 @@ K_WORK_DEFINE(diag_session_work, diag_session_handler);
 K_WORK_DEFINE(heat_request_work, heat_request_handler);
 
 void state_machine_cb(struct k_timer *timer) {
-    if (temperature_status_charge == TEMPERATURE_STATUS_UNDER_OPTIMAL) {
+    if (temperature_status_charge == TEMPERATURE_STATUS_UNDER_OPTIMAL && is_heating_enabled) {
         if (session_error) {
             k_work_submit(&diag_session_work);
             printk("Got session error, switching");
@@ -152,6 +191,17 @@ void debug_cb(struct k_timer *timer) {
     printk("Predicted power: %.1fkW (%.1fA)\n", max_charge_power_kw, max_charge_current_amp);
     printk("Battery temp min/max: %.1fC / %.1fC\n", battery_min_temp, battery_max_temp);
     printk("\n");
+
+    if (usb_uart_dev) {
+        char buf[128];
+        int n = snprintf(buf, sizeof(buf), "HS:%d,%d,%u,%u;TS:%d;P:%.1fkW,%.1fA;BT:%.1f/%.1f\n",
+                         battery_heating_active, heating_request, power_battery_heating_watt, power_battery_heating_req_watt,
+                         temperature_status_charge, max_charge_power_kw, max_charge_current_amp,
+                         battery_min_temp, battery_max_temp);
+        if (n > 0) {
+            uart_fifo_fill(usb_uart_dev, (const uint8_t *)buf, MIN(n, (int)sizeof(buf)));
+        }
+    }
 }
 
 K_TIMER_DEFINE(state_machine_timer, state_machine_cb, NULL);
@@ -160,8 +210,19 @@ K_TIMER_DEFINE(debug_timer, debug_cb, NULL);
 int main(void)
 {
 	if (usb_enable(NULL)) {
-		return 0;
+        return 0;
 	}
+
+    /* bind the USB CDC ACM console (so we can write structured data to ESP32) */
+    usb_uart_dev = device_get_binding(DT_LABEL(DT_CHOSEN(zephyr_console)));
+    if (!usb_uart_dev) {
+        printk("USB CDC ACM console not found\n");
+    } else if (!device_is_ready(usb_uart_dev)) {
+        printk("USB CDC ACM device not ready\n");
+    } else {
+        uart_irq_callback_user_data_set(usb_uart_dev, uart_isr, NULL);
+        uart_irq_rx_enable(usb_uart_dev);
+    }
 
     gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
     gpio_pin_configure_dt(&rx_led, GPIO_OUTPUT_INACTIVE);
@@ -201,11 +262,12 @@ int main(void)
         .mask = CAN_EXT_ID_MASK,
     };
 
-    can_add_rx_filter(can_dev, diag_cb, NULL, &diag_filter);
     can_add_rx_filter(can_dev, heating_status_cb, NULL, &heating_status_filter);
     can_add_rx_filter(can_dev, charging_optimization_cb, NULL, &charging_optimization_filter);
     can_add_rx_filter(can_dev, dynamic_cb, NULL, &dynamic_filter);
     can_add_rx_filter(can_dev, temp_cb, NULL, &temp_filter);
+    can_add_rx_filter(can_dev, diag_cb, NULL, &diag_filter);
+
 
     k_timer_start(&debug_timer, K_MSEC(1000), K_MSEC(1000));
     k_timer_start(&state_machine_timer, K_MSEC(250), K_MSEC(500));
